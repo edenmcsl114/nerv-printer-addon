@@ -1391,6 +1391,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
+    /**
+     * Queues a waypoint on the permanently built lane north of the map area. Walking there first keeps
+     * the bot from crossing columns that are already mined (and falling into the pit below) when it
+     * starts a mining session somewhere inside the map area.
+     */
+    private void addWalkwayCheckpoint() {
+        if (mapCorner == null || mc.player == null) return;
+        int relativeX = Math.max(0, Math.min(127, mc.player.getBlockX() - mapCorner.getX()));
+        Vec3d lane = mapCorner.toCenterPos().add(relativeX, 0.5, -mineLineEndOffset.get());
+        checkpoints.add(0, new Pair<>(lane, new Pair<>("walkRestock", null)));
+    }
+
     private void addClosestRestockCheckpoint() {
         //Determine closest restock chest for material in restock list
         if (restockList.isEmpty()) return;
@@ -1646,10 +1658,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         info("Start mining map");
         if (availableSlots.isEmpty() && !setupSlots()) return;
         building = false;
+        boolean freshSession = !mining;     //starting (or resuming) mining, walk onto the lane first
         mining = true;
         minedLines = -1;
         advanceMinedLines();
         calculateMiningPath();
+        if (freshSession) addWalkwayCheckpoint();
         if (hasMiningTool()) {
             info("Mining tools already in the inventory, skipping dump and restock.");
         } else {
@@ -1945,8 +1959,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     public void mineLine(int lines) {
         minedLines = lines;
         building = false;
+        boolean freshSession = !mining;     //first line of a (resumed) session
         mining = true;
         calculateMiningPath();
+        if (freshSession) addWalkwayCheckpoint();
         state = State.Walking;
         saveProgress();
     }
