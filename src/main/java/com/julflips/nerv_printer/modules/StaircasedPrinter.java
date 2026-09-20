@@ -473,6 +473,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     boolean autoStartMining;                    //True when the pending start should resume mining
     int autoStartTicks;                         //Timeout of the pending start
     int autoStartSettle;                        //Short delay so the world is loaded before starting
+    boolean fellWarning;                        //True while the "fell below the map" warning was printed
     static final int AUTO_START_TIMEOUT = 1200; //Ticks to wait for the slaves (~60s)
     static final int AUTO_START_SETTLE = 100;   //Ticks to wait before starting (~5s)
     int minedLines;
@@ -553,6 +554,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         autoStartMining = false;
         autoStartTicks = 0;
         autoStartSettle = 0;
+        fellWarning = false;
         minedLines = 128;
         oldState = null;
         debugPreviousState = null;
@@ -908,6 +910,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (autoStartPending) {
             handleAutoStart();
             if (autoStartPending) return;
+        }
+
+        if (mapCorner != null && mc.player.getY() < mapCorner.getY()) {
+            if (!fellWarning) {
+                fellWarning = true;
+                warning("Fell below the map area at " + mc.player.getBlockPos().toShortString() + " - blocks in front of the bot were missing.");
+            }
+        } else {
+            fellWarning = false;
         }
 
         long timeDifference = System.currentTimeMillis() - lastTickTime;
@@ -1268,6 +1279,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             mc.player.setSprinting(true);
         }
         final List<String> allowPlaceActions = Arrays.asList("", "lineEnd", "sprint", "miningLineEnd");
+        //Walking back to the lane during building: keep the floor in front of us intact, just like
+        //the normal building pass does. Columns between the bot and the lane can still be empty.
+        if (building && "walkLane".equals(nextAction)) {
+            placeAheadOnWalkway();
+        }
         if (!allowPlaceActions.contains(nextAction)) return;
 
         BlockPos nextBlockPos = getNextBlockPos(state.equals(State.Mining));
@@ -1433,7 +1449,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (mapCorner == null || mc.player == null) return;
         int relativeX = Math.max(0, Math.min(127, mc.player.getBlockX() - mapCorner.getX()));
         Vec3d lane = mapCorner.toCenterPos().add(relativeX, 0.5, -mineLineEndOffset.get());
-        checkpoints.add(0, new Pair<>(lane, new Pair<>("walkRestock", null)));
+        info("Walking back to the lane north of the map first.");
+        checkpoints.add(0, new Pair<>(lane, new Pair<>("walkLane", null)));
+    }
+
+    /**
+     * Places the map block in front of the bot while it walks back to the lane. The columns between
+     * the bot and the lane can still be empty, so without this the bot would walk over them and drop
+     * into the pit below the map.
+     */
+    private void placeAheadOnWalkway() {
+        if (mapCorner == null || mc.player == null) return;
+        int relativeX = mc.player.getBlockX() - mapCorner.getX();
+        if (relativeX < 0 || relativeX > 127) return;
+        int aheadZ = mc.player.getBlockZ() - mapCorner.getZ() - 1;   //the cell towards the lane
+        if (aheadZ < 0 || aheadZ > 127) return;
+        if (map[relativeX][aheadZ] == null) return;
+        BlockPos pos = mapCorner.add(relativeX, map[relativeX][aheadZ].getRight(), aheadZ);
+        if (!MapAreaCache.getCachedBlockState(pos).isAir()) return;
+        if (PlayerUtils.distanceTo(pos.toCenterPos()) > interactionRange.get()) return;
+        tryPlacingBlock(pos);
     }
 
     private void addClosestRestockCheckpoint() {
@@ -1995,6 +2030,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     public void skipBuilding() {
         if (availableSlots.isEmpty()) setupSlots();
+        building = false;
         knownErrors.clear();
         checkpoints.clear();
         if (SlaveSystem.isSlave()) {
