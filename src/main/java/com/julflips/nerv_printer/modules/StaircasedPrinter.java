@@ -1279,10 +1279,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             mc.player.setSprinting(true);
         }
         final List<String> allowPlaceActions = Arrays.asList("", "lineEnd", "sprint", "miningLineEnd");
-        //Walking back to the lane during building: keep the floor in front of us intact, just like
-        //the normal building pass does. Columns between the bot and the lane can still be empty.
-        if (building && "walkLane".equals(nextAction)) {
-            placeAheadOnWalkway();
+        //While building, keep the cell we are about to step on filled - walking through the map area
+        //with missing blocks would drop the bot into the pit.
+        if (building) {
+            placeStepAhead();
         }
         if (!allowPlaceActions.contains(nextAction)) return;
 
@@ -1453,21 +1453,35 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         checkpoints.add(0, new Pair<>(lane, new Pair<>("walkLane", null)));
     }
 
+    /** True when the inventory holds the given item. */
+    private boolean hasMaterial(Item item) {
+        if (mc.player == null) return false;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (!stack.isEmpty() && stack.getItem() == item) return true;
+        }
+        return false;
+    }
+
     /**
-     * Places the map block in front of the bot while it walks back to the lane. The columns between
-     * the bot and the lane can still be empty, so without this the bot would walk over them and drop
-     * into the pit below the map.
+     * Places the map block the bot is about to step on while it walks. The bot often has to walk
+     * through parts of the map area that are not built yet (for example back to the lane, or from
+     * the lane to the row it was working on after a restock), and without this it would drop into
+     * the pit below the map.
      */
-    private void placeAheadOnWalkway() {
-        if (mapCorner == null || mc.player == null) return;
+    private void placeStepAhead() {
+        if (mapCorner == null || mc.player == null || checkpoints.isEmpty()) return;
+        Vec3d goal = checkpoints.get(0).getLeft();
+        int step = goal.z < mc.player.getZ() ? -1 : 1;              //north when walking to the lane
         int relativeX = mc.player.getBlockX() - mapCorner.getX();
-        if (relativeX < 0 || relativeX > 127) return;
-        int aheadZ = mc.player.getBlockZ() - mapCorner.getZ() - 1;   //the cell towards the lane
-        if (aheadZ < 0 || aheadZ > 127) return;
+        int aheadZ = mc.player.getBlockZ() - mapCorner.getZ() + step;
+        if (relativeX < 0 || relativeX > 127 || aheadZ < 0 || aheadZ > 127) return;
         if (map[relativeX][aheadZ] == null) return;
         BlockPos pos = mapCorner.add(relativeX, map[relativeX][aheadZ].getRight(), aheadZ);
         if (!MapAreaCache.getCachedBlockState(pos).isAir()) return;
         if (PlayerUtils.distanceTo(pos.toCenterPos()) > interactionRange.get()) return;
+        //Only place when the material is available, the normal flow takes care of restocking.
+        if (!hasMaterial(map[relativeX][aheadZ].getLeft().asItem())) return;
         tryPlacingBlock(pos);
     }
 
