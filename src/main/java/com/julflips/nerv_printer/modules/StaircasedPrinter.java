@@ -1055,7 +1055,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (dumpSlot == -1) {
                 state = State.Walking;
                 if (SlaveSystem.isSlave() && checkpoints.isEmpty()) {
-                    refillMiningInventory();
+                    if (hasMiningTool()) {
+                        //Nothing left to prepare, ask the master for a mining line right away.
+                        info("Mining tools already in the inventory, skipping restock.");
+                        state = State.AwaitSlaveMineLine;
+                        SlaveSystem.queueMasterDM("finished");
+                    } else {
+                        refillMiningInventory();
+                    }
                 } else {
                     HashMap<Item, Integer> requiredItems = getRequiredItems();
                     Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
@@ -1245,17 +1252,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 mc.player.setPitch((float) Rotations.getPitch(miningPos));
                 BlockState blockState = MapAreaCache.getCachedBlockState(miningPos);
                 ItemStack bestTool = ToolUtils.getBestTool(toolSet, blockState);
-                for (int slot : availableHotBarSlots) {
-                    if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
-                    Item item = mc.player.getInventory().getStack(slot).getItem();
-                    if (item.equals(bestTool.getItem())) {
-                        InvUtils.swap(slot, false);
-                        BlockUtils.breakBlock(miningPos, true);
-                        state = State.Mining;
-                        if (Math.abs(miningPos.getZ() - mc.player.getZ()) >= maxMiningRange.get()) {
-                            state = State.AwaitBlockBreak;
-                        }
-                        break;
+                int toolSlot = findTool(bestTool);
+                if (toolSlot != -1) {
+                    equipTool(toolSlot);
+                    BlockUtils.breakBlock(miningPos, true);
+                    state = State.Mining;
+                    if (Math.abs(miningPos.getZ() - mc.player.getZ()) >= maxMiningRange.get()) {
+                        state = State.AwaitBlockBreak;
                     }
                 }
             }
@@ -1350,6 +1353,42 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         addClosestRestockCheckpoint();
+    }
+
+    /**
+     * True when the inventory already contains a tool that is used to mine this map. In that case the
+     * bot skips dumping its items and restocking tools before mining.
+     */
+    private boolean hasMiningTool() {
+        if (mc.player == null || toolSet.isEmpty()) return false;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty() || !ToolUtils.isTool(stack)) continue;
+            for (ItemStack tool : toolSet) {
+                if (tool.getItem() == stack.getItem()) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Slot that holds the given tool, hotbar slots are preferred. Returns -1 when there is none. */
+    private int findTool(ItemStack tool) {
+        if (tool == null || mc.player == null) return -1;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty() || stack.getItem() != tool.getItem()) continue;
+            return slot;
+        }
+        return -1;
+    }
+
+    /** Selects a hotbar slot, or swaps a tool from the inventory into the selected hotbar slot. */
+    private void equipTool(int slot) {
+        if (slot >= 0 && slot < 9) {
+            mc.player.getInventory().setSelectedSlot(slot);
+        } else {
+            mc.interactionManager.clickSlot(mc.player.playerScreenHandler.syncId, slot, mc.player.getInventory().getSelectedSlot(), SlotActionType.SWAP, mc.player);
+        }
     }
 
     private void addClosestRestockCheckpoint() {
@@ -1611,7 +1650,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         minedLines = -1;
         advanceMinedLines();
         calculateMiningPath();
-        refillMiningInventory();
+        if (hasMiningTool()) {
+            info("Mining tools already in the inventory, skipping dump and restock.");
+        } else {
+            refillMiningInventory();
+        }
         state = State.Walking;
         if (sleep.get()) {
             if (bed == null) {
@@ -1869,8 +1912,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         knownErrors.clear();
         checkpoints.clear();
         if (SlaveSystem.isSlave()) {
-            checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
-            state = State.Walking;
+            if (hasMiningTool()) {
+                //Tools are already there, so there is nothing to dump or restock before mining.
+                info("Mining tools already in the inventory, skipping dump and restock.");
+                state = State.AwaitSlaveMineLine;
+                SlaveSystem.queueMasterDM("finished");
+            } else {
+                checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
+                state = State.Walking;
+            }
         } else {
             try {
                 if (moveToFinishedFolder.get())
