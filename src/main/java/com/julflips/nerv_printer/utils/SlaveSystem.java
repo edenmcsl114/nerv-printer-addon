@@ -37,6 +37,8 @@ public final class SlaveSystem {
     private static ArrayList<String> toBeSentMessages = new ArrayList<>();
     private static ArrayList<String> toBeConfirmedSlaves = new ArrayList<>();
     private static String master = null;
+    private static int rejoinTimer = 0;
+    private static final int REJOIN_INTERVAL = 200;    //ticks between automatic re-registration attempts (~10s)
 
     public static void setupSlaveSystem(MapPrinter module, int delay, String dmCommand, String prefix, String suffix, int randomSuffixLength) {
         printerModule = module;
@@ -51,6 +53,7 @@ public final class SlaveSystem {
         activeSlavesDict.clear();
         finishedSlavesDict.clear();
         master = null;
+        rejoinTimer = 0;
     }
 
     public static void queueMasterDM(String message) {
@@ -164,6 +167,7 @@ public final class SlaveSystem {
         slaves.remove(slave);
         activeSlavesDict.remove(slave);
         finishedSlavesDict.remove(slave);
+        if (printerModule != null) printerModule.setSlaveNames(new ArrayList<>(slaves));
         queueDM(slave, "remove");
         generateIntervals();
     }
@@ -175,6 +179,33 @@ public final class SlaveSystem {
             }
         }
         return false;
+    }
+
+    /** Master side: register a slave. Used by the normal "accept" handshake and by the automatic "rejoin". */
+    private static void registerSlave(String slave) {
+        if (!slaves.contains(slave)) slaves.add(slave);
+        finishedSlavesDict.put(slave, false);
+        activeSlavesDict.put(slave, false);
+        toBeConfirmedSlaves.remove(slave);
+        ChatUtils.info("Registered slave: " + slave + " Total slaves: " + slaves.size());
+        generateIntervals();
+        if (printerModule != null) {
+            //Persist the list so the slaves can be accepted again without pressing Register after a restart.
+            printerModule.setSlaveNames(new ArrayList<>(slaves));
+            //Let a slave that came back while a print is running catch up with it.
+            printerModule.slaveJoined(slave);
+        }
+        if (tableController != null) tableController.rebuild();
+    }
+
+    /** Slave side: ask the master we remember from the last session to take us back. */
+    private static void tryRejoinMaster() {
+        if (printerModule == null || isSlave()) return;
+        String masterName = printerModule.getMasterName();
+        if (masterName == null || masterName.isEmpty()) return;
+        if (mc.world == null || mc.player == null) return;
+        if (!canSeePlayer(masterName)) return;
+        queueDM(masterName, "rejoin");
     }
 
     private static void handleMessage(String rawMessage, @Nullable String sender) {
@@ -198,7 +229,15 @@ public final class SlaveSystem {
         if (command.equals("register") && master == null && toBeConfirmedSlaves.isEmpty()
             && slaves.isEmpty() && canSeePlayer(sender)) {
             master = sender;
+            if (printerModule != null) printerModule.setMasterName(sender);   //remember it for automatic recovery
             SlaveSystem.queueMasterDM("accept");
+        }
+        // Slave asking to be taken back after a restart / relog. Only names that were registered
+        // before (and are in render distance) are accepted, so strangers can not join by accident.
+        if (command.equals("rejoin") && printerModule != null && !printerModule.getSlaveNames().isEmpty()
+            && printerModule.getSlaveNames().contains(sender) && !slaves.contains(sender) && canSeePlayer(sender)) {
+            registerSlave(sender);
+            queueDM(sender, "accept");
         }
         // Master to Client message
         if (sender.equals(master)) {
@@ -216,6 +255,7 @@ public final class SlaveSystem {
                     break;
                 case "remove":
                     master = null;
+                    if (printerModule != null) printerModule.setMasterName("");
                     printerModule.toggle();
                     break;
                 case "skip":
@@ -230,13 +270,7 @@ public final class SlaveSystem {
         if (slaves.contains(sender) || toBeConfirmedSlaves.contains(sender)) {
             switch (command) {
                 case "accept":
-                    slaves.add(sender);
-                    finishedSlavesDict.put(sender, false);
-                    activeSlavesDict.put(sender, false);
-                    toBeConfirmedSlaves.remove(sender);
-                    ChatUtils.info("Registered slave: " + sender + " Total slaves: " + slaves.size());
-                    generateIntervals();
-                    if (tableController != null) tableController.rebuild();
+                    registerSlave(sender);
                     break;
                 case "finished":
                     finishedSlavesDict.put(sender, true);
@@ -269,6 +303,12 @@ public final class SlaveSystem {
     @EventHandler
     private static void onTick(TickEvent.Pre event) {
         if (mc.getNetworkHandler() == null) return;
+        if (rejoinTimer <= 0) {
+            tryRejoinMaster();
+            rejoinTimer = REJOIN_INTERVAL;
+        } else {
+            rejoinTimer--;
+        }
         if (timeout > 0) timeout--;
         if (!toBeSentMessages.isEmpty()) {
             if (timeout <= 0) {

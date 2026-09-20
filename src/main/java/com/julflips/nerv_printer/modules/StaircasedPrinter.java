@@ -1,5 +1,7 @@
 package com.julflips.nerv_printer.modules;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.julflips.nerv_printer.Addon;
 import com.julflips.nerv_printer.interfaces.MapPrinter;
 import com.julflips.nerv_printer.utils.*;
@@ -48,6 +50,9 @@ import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.file.Files;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -353,6 +358,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<String> masterName = sgMultiUser.add(new StringSetting.Builder()
+        .name("master-name")
+        .description("The master this account belongs to. Filled in automatically, used to re-register after a restart.")
+        .defaultValue("")
+        .build()
+    );
+
+    private final Setting<List<String>> slaveNames = sgMultiUser.add(new StringListSetting.Builder()
+        .name("slaves")
+        .description("Accounts this master coordinates. Filled in automatically, used as whitelist and for automatic recovery.")
+        .defaultValue()
+        .build()
+    );
+
     //Error Handling
 
     private final Setting<Boolean> logErrors = sgError.add(new BoolSetting.Builder()
@@ -441,6 +460,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int interactTimeout;
     int toBeSwappedSlot;
     int restockSyncId = -1;                     //syncId of the container the restock backlog belongs to
+    boolean building;                           //True while this bot is in the building phase
+    boolean mining;                             //True while this bot is in the mining phase
     int minedLines;
     long lastTickTime;
     boolean closeNextInvPacket;
@@ -513,6 +534,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         interactTimeout = 0;
         toBeSwappedSlot = -1;
         restockSyncId = -1;
+        building = false;
+        mining = false;
         minedLines = 128;
         oldState = null;
         debugPreviousState = null;
@@ -564,6 +587,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         } else {
             info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
         }
+
+        //Continue an interrupted map (and jump back into mining when that is where it stopped).
+        applyProgress();
     }
 
     @Override
@@ -1505,8 +1531,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void advanceMinedLines() {
         while (minedLines <= map.length) {
             minedLines++;
-            if (!isLineMined(minedLines)) return;
+            if (!isLineMined(minedLines)) break;
         }
+        if (mining) saveProgress();
     }
 
     private boolean isLineMined(int line) {
@@ -1525,6 +1552,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void startBuilding() {
         info("Start building map");
+        building = true;
+        mining = false;
+        saveProgress();
         if (!SlaveSystem.isSlave()) SlaveSystem.startAllSlaves();
         if (availableSlots.isEmpty()) setupSlots();
         MapAreaCache.reset(mapCorner);
@@ -1575,6 +1605,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void startMining() {
         info("Start mining map");
+        if (availableSlots.isEmpty() && !setupSlots()) return;
+        building = false;
+        mining = true;
         minedLines = -1;
         advanceMinedLines();
         calculateMiningPath();
@@ -1594,11 +1627,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             SlaveSystem.activeSlavesDict.put(slave, true);
             SlaveSystem.finishedSlavesDict.put(slave, false);
         }
+        saveProgress();
     }
 
     private void endMining() {
         // Only executed on Master
         info("Finished mining map");
+        mining = false;
+        clearProgress();
         SlaveSystem.sendToAllSlaves("start");
         for (String slave : SlaveSystem.activeSlavesDict.keySet()) {
             SlaveSystem.activeSlavesDict.put(slave, true);
@@ -1800,19 +1836,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     public void start() {
-        if (availableSlots.isEmpty()) {
-            state = State.AwaitNBTFile;
-            return;
-        }
-        if (state.equals(State.AwaitSlaveContinue)) {
+        if (state == State.AwaitSlaveContinue) {
             state = oldState;
             return;
         }
-        if (state.equals(State.AwaitSlaveMineLine)) {
+        if (state == State.AwaitSlaveMineLine) {
             checkpoints.clear();
             checkpoints.add(0, new Pair(usedToolChest.getRight(), new Pair("usedToolChest", null)));
             state = State.Walking;
+            return;
         }
+        if (mining) {
+            //Already mining this map, the master only hands out lines to us.
+            return;
+        }
+        if (mapCorner == null || map == null) {
+            //Nothing to work with yet, let the normal flow pick up a file first.
+            state = State.AwaitNBTFile;
+            return;
+        }
+        //(Re)join: build the interval we got assigned, already finished lines are skipped.
+        if (availableSlots.isEmpty() && !setupSlots()) return;
+        startBuilding();
     }
 
     public boolean getActivationReset() {
@@ -1849,8 +1894,44 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     public void mineLine(int lines) {
         minedLines = lines;
+        building = false;
+        mining = true;
         calculateMiningPath();
         state = State.Walking;
+        saveProgress();
+    }
+
+    @Override
+    public String getMasterName() {
+        return masterName.get();
+    }
+
+    @Override
+    public void setMasterName(String name) {
+        masterName.set(name == null ? "" : name);
+    }
+
+    @Override
+    public List<String> getSlaveNames() {
+        return slaveNames.get();
+    }
+
+    @Override
+    public void setSlaveNames(List<String> names) {
+        slaveNames.set(new ArrayList<>(names));
+    }
+
+    @Override
+    public void slaveJoined(String slave) {
+        //A slave can join (or come back) while a map is already being worked on - let it catch up.
+        if (mapCorner == null || map == null) return;
+        if (mining) {
+            //Let the slave fetch mining tools first, it asks for a line once it is ready.
+            SlaveSystem.queueDM(slave, "skip");
+        } else if (building) {
+            SlaveSystem.queueDM(slave, "start");
+            SlaveSystem.activeSlavesDict.put(slave, true);
+        }
     }
 
     // Path Change Check
@@ -1958,6 +2039,102 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     // NBT file handling
+
+    // Progress System (continue where the last session was interrupted)
+
+    private static class ProgressData {
+        String file;            //name of the nbt file that was being processed
+        String stage;           //"building" or "mining"
+        int minedLines;
+        long updated;
+    }
+
+    private File progressFile() {
+        String name = mc.player != null ? mc.player.getName().getString() : "unknown";
+        return new File(mapFolder, "_progress_" + name + ".json");
+    }
+
+    private void saveProgress() {
+        if (mapFolder == null || mapFile == null) return;
+        ProgressData data = new ProgressData();
+        data.file = mapFile.getName();
+        data.stage = mining ? "mining" : "building";
+        data.minedLines = mining ? minedLines : -1;
+        data.updated = System.currentTimeMillis();
+        try (Writer writer = Files.newBufferedWriter(progressFile().toPath())) {
+            new GsonBuilder().setPrettyPrinting().create().toJson(data, writer);
+        } catch (IOException e) {
+            warning("Could not write the progress file.");
+        }
+    }
+
+    private ProgressData loadProgress() {
+        if (mapFolder == null) return null;
+        File file = progressFile();
+        if (!file.isFile()) return null;
+        try (Reader reader = Files.newBufferedReader(file.toPath())) {
+            return new Gson().fromJson(reader, ProgressData.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void clearProgress() {
+        if (mapFolder == null) return;
+        File file = progressFile();
+        if (file.isFile() && !file.delete()) warning("Could not delete the progress file.");
+    }
+
+    /** Looks for the nbt file in the map folder, or in the finished-maps folder if it was archived already. */
+    private File findMapFile(String name) {
+        File inFolder = new File(mapFolder, name);
+        if (inFolder.isFile()) return inFolder;
+        File archived = new File(new File(mapFolder, "_finished_maps"), name);
+        return archived.isFile() ? archived : null;
+    }
+
+    /**
+     * Called when the module is enabled. If the last session was interrupted, the same map is continued -
+     * and if it stopped during the mining phase the bot jumps straight back into mining instead of
+     * rebuilding the map first.
+     */
+    private void applyProgress() {
+        ProgressData progress = loadProgress();
+        if (progress == null || progress.file == null || progress.file.isEmpty()) return;
+
+        File file = findMapFile(progress.file);
+        if (file == null) {
+            warning("Progress file refers to " + progress.file + ", but the file could not be found.");
+            clearProgress();
+            return;
+        }
+
+        if (mapFile == null || !mapFile.getName().equals(progress.file)) {
+            mapFile = file;
+            if (!loadNBTFile()) {
+                warning("Could not read the nbt file of the last session.");
+                clearProgress();
+                toggle();
+                return;
+            }
+        }
+        if (!startedFiles.contains(file)) startedFiles.add(file);
+
+        if ("mining".equals(progress.stage)) {
+            if (mapCorner == null || materialDict.isEmpty()) {
+                info("Unfinished map §a" + progress.file + "§7 found. Load a config and start printing to continue mining.");
+                return;
+            }
+            if (masterName.get().isEmpty()) {
+                info("Resuming mining of §a" + progress.file);
+                startMining();
+            } else {
+                info("Unfinished map §a" + progress.file + "§7 found. Waiting for the master to assign a mining line.");
+            }
+        } else {
+            info("Unfinished map §a" + progress.file + "§7 found, it will be finished first.");
+        }
+    }
 
     private boolean prepareNextMapFile() {
         mapFile = Utils.getNextMapFile(mapFolder, startedFiles, moveToFinishedFolder.get());

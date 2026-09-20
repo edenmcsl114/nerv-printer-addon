@@ -344,6 +344,20 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<String> masterName = sgMultiUser.add(new StringSetting.Builder()
+        .name("master-name")
+        .description("The master this account belongs to. Filled in automatically, used to re-register after a restart.")
+        .defaultValue("")
+        .build()
+    );
+
+    private final Setting<List<String>> slaveNames = sgMultiUser.add(new StringListSetting.Builder()
+        .name("slaves")
+        .description("Accounts this master coordinates. Filled in automatically, used as whitelist and for automatic recovery.")
+        .defaultValue()
+        .build()
+    );
+
     //Error Handling
 
     private final Setting<Boolean> logErrors = sgError.add(new BoolSetting.Builder()
@@ -424,6 +438,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
     int interactTimeout;
     int toBeSwappedSlot;
     int restockSyncId = -1;                     //syncId of the container the restock backlog belongs to
+    boolean building;                           //True while this bot is in the building phase
     long lastTickTime;
     boolean closeNextInvPacket;
     State state;
@@ -490,6 +505,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         closeResetChestTicks = 0;
         toBeSwappedSlot = -1;
         restockSyncId = -1;
+        building = false;
         oldState = null;
         debugPreviousState = null;
 
@@ -1287,6 +1303,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private void startBuilding() {
+        building = true;
         if (!SlaveSystem.isSlave()) SlaveSystem.startAllSlaves();
         if (availableSlots.isEmpty()) setupSlots();
         MapAreaCache.reset(mapCorner);
@@ -1297,6 +1314,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     private boolean endBuilding() {
         info("Finished building map");
+        building = false;
         state = State.Walking;
         knownErrors.clear();
         SlaveSystem.setAllSlavesUnfinished();
@@ -1554,6 +1572,34 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     public void slaveFinished(String slave) {
+    }
+
+    @Override
+    public String getMasterName() {
+        return masterName.get();
+    }
+
+    @Override
+    public void setMasterName(String name) {
+        masterName.set(name == null ? "" : name);
+    }
+
+    @Override
+    public List<String> getSlaveNames() {
+        return slaveNames.get();
+    }
+
+    @Override
+    public void setSlaveNames(List<String> names) {
+        slaveNames.set(new ArrayList<>(names));
+    }
+
+    @Override
+    public void slaveJoined(String slave) {
+        //The carpet printer has no mining phase, a slave that comes back simply joins the current map.
+        if (mapCorner == null || map == null || !building) return;
+        SlaveSystem.queueDM(slave, "start");
+        SlaveSystem.activeSlavesDict.put(slave, true);
     }
 
     // Path Change Check
