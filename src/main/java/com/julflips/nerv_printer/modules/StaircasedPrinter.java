@@ -1618,6 +1618,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 checkpoints.add(0, new Pair(bed.getRight(), new Pair("sleep", null)));
             }
         }
+        //Get back onto the lane north of the map first. Walking towards the map from a position inside
+        //it (for example when a session is continued after a restart) would cross columns that are not
+        //built yet and could make the bot fall into the pit below.
+        addWalkwayCheckpoint();
         state = State.Walking;
     }
 
