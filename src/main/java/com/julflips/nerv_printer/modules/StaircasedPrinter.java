@@ -1733,7 +1733,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         minedLines = -1;
         advanceMinedLines();
         calculateMiningPath();
-        if (freshSession) addWalkwayCheckpoint();
         if (hasMiningTool()) {
             info("Mining tools already in the inventory, skipping dump and restock.");
         } else {
@@ -1747,6 +1746,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 checkpoints.add(0, new Pair(bed.getRight(), new Pair("sleep", null)));
             }
         }
+        //The lane has to be the very first waypoint. Walking to the bed or the tool chest from a
+        //position inside the map area would cross columns that are already mined.
+        if (freshSession) addWalkwayCheckpoint();
         for (String slave : SlaveSystem.slaves) {
             if (minedLines >= map.length) break;
             SlaveSystem.queueDM(slave, "mine:" + minedLines);
@@ -2003,6 +2005,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 SlaveSystem.queueMasterDM("finished");
             } else {
                 checkpoints.add(new Pair(dumpStation.getLeft(), new Pair("dump", null)));
+                //Get onto the lane first, walking to the dump station from inside the map area could
+                //cross columns that are already mined.
+                addWalkwayCheckpoint();
                 state = State.Walking;
             }
         } else {
