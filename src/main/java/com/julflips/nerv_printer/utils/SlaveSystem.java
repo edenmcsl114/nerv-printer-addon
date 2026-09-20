@@ -39,6 +39,8 @@ public final class SlaveSystem {
     private static String master = null;
     private static int rejoinTimer = 0;
     private static final int REJOIN_INTERVAL = 200;    //ticks between automatic re-registration attempts (~10s)
+    private static int registerTimer = 0;
+    private static final HashMap<String, Integer> registerTries = new HashMap<>();
 
     public static void setupSlaveSystem(MapPrinter module, int delay, String dmCommand, String prefix, String suffix, int randomSuffixLength) {
         printerModule = module;
@@ -54,6 +56,8 @@ public final class SlaveSystem {
         finishedSlavesDict.clear();
         master = null;
         rejoinTimer = 0;
+        registerTimer = 0;
+        registerTries.clear();
     }
 
     public static void queueMasterDM(String message) {
@@ -167,7 +171,11 @@ public final class SlaveSystem {
         slaves.remove(slave);
         activeSlavesDict.remove(slave);
         finishedSlavesDict.remove(slave);
-        if (printerModule != null) printerModule.setSlaveNames(new ArrayList<>(slaves));
+        if (printerModule != null) {
+            ArrayList<String> names = new ArrayList<>(printerModule.getSlaveNames());
+            names.remove(slave);
+            printerModule.setSlaveNames(names);
+        }
         queueDM(slave, "remove");
         generateIntervals();
     }
@@ -190,8 +198,12 @@ public final class SlaveSystem {
         ChatUtils.info("Registered slave: " + slave + " Total slaves: " + slaves.size());
         generateIntervals();
         if (printerModule != null) {
-            //Persist the list so the slaves can be accepted again without pressing Register after a restart.
-            printerModule.setSlaveNames(new ArrayList<>(slaves));
+            //Persist the list so the slaves can be accepted again without pressing Register after a
+            //restart. Names that are already in it are kept - a slave that did not rejoin yet must not
+            //be dropped from the list, otherwise it could never come back.
+            ArrayList<String> names = new ArrayList<>(printerModule.getSlaveNames());
+            if (!names.contains(slave)) names.add(slave);
+            printerModule.setSlaveNames(names);
             //Let a slave that came back while a print is running catch up with it.
             printerModule.slaveJoined(slave);
         }
@@ -206,6 +218,23 @@ public final class SlaveSystem {
         if (mc.world == null || mc.player == null) return;
         if (!canSeePlayer(masterName)) return;
         queueDM(masterName, "rejoin");
+    }
+
+    /**
+     * Master side: after a restart the slaves are usually still running and waiting for us, so contact
+     * the names we registered last time (a few times each, while they are in render distance).
+     */
+    private static void tryRegisterKnownSlaves() {
+        if (printerModule == null || isSlave()) return;
+        for (String name : printerModule.getSlaveNames()) {
+            if (slaves.contains(name)) continue;
+            int tries = registerTries.getOrDefault(name, 0);
+            if (tries >= 6) continue;
+            if (!canSeePlayer(name)) continue;
+            if (!toBeConfirmedSlaves.contains(name)) toBeConfirmedSlaves.add(name);
+            queueDM(name, "register");
+            registerTries.put(name, tries + 1);
+        }
     }
 
     private static void handleMessage(String rawMessage, @Nullable String sender) {
@@ -226,18 +255,31 @@ public final class SlaveSystem {
         String[] colonSplit = content.replace(" ", "").split(":");
         String command = colonSplit[0];
         // Register
-        if (command.equals("register") && master == null && toBeConfirmedSlaves.isEmpty()
-            && slaves.isEmpty() && canSeePlayer(sender)) {
-            master = sender;
-            if (printerModule != null) printerModule.setMasterName(sender);   //remember it for automatic recovery
-            SlaveSystem.queueMasterDM("accept");
+        if (command.equals("register") && canSeePlayer(sender)) {
+            if (master == null && toBeConfirmedSlaves.isEmpty() && slaves.isEmpty()) {
+                master = sender;
+                if (printerModule != null) printerModule.setMasterName(sender);   //remember it for automatic recovery
+                SlaveSystem.queueMasterDM("accept");
+            } else if (printerModule != null && sender.equals(printerModule.getMasterName())) {
+                //Our master asks again (it restarted), confirm so it can register us once more.
+                queueDM(sender, "accept");
+            }
+        }
+        // Slave side: the master confirmed that it took us back after a restart, so bind to it again.
+        if (command.equals("accept") && master == null && printerModule != null) {
+            String configuredMaster = printerModule.getMasterName();
+            if (!configuredMaster.isEmpty() && configuredMaster.equals(sender)) {
+                master = sender;
+                ChatUtils.info("Re-joined master " + sender + ".");
+            }
         }
         // Slave asking to be taken back after a restart / relog. Only names that were registered
         // before (and are in render distance) are accepted, so strangers can not join by accident.
         if (command.equals("rejoin") && printerModule != null && !printerModule.getSlaveNames().isEmpty()
-            && printerModule.getSlaveNames().contains(sender) && !slaves.contains(sender) && canSeePlayer(sender)) {
-            registerSlave(sender);
+            && printerModule.getSlaveNames().contains(sender) && canSeePlayer(sender)) {
+            //Answer first - the slave needs this confirmation to bind to us again.
             queueDM(sender, "accept");
+            if (!slaves.contains(sender)) registerSlave(sender);
         }
         // Master to Client message
         if (sender.equals(master)) {
@@ -308,6 +350,12 @@ public final class SlaveSystem {
             rejoinTimer = REJOIN_INTERVAL;
         } else {
             rejoinTimer--;
+        }
+        if (registerTimer <= 0) {
+            tryRegisterKnownSlaves();
+            registerTimer = REJOIN_INTERVAL;
+        } else {
+            registerTimer--;
         }
         if (timeout > 0) timeout--;
         if (!toBeSentMessages.isEmpty()) {
