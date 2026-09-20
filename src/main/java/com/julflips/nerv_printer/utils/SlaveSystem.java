@@ -77,6 +77,20 @@ public final class SlaveSystem {
         return true;
     }
 
+    /** Master side: true when every slave of the last session is registered again. */
+    public static boolean allKnownSlavesRegistered() {
+        if (printerModule == null) return true;
+        for (String name : printerModule.getSlaveNames()) {
+            if (!slaves.contains(name)) return false;
+        }
+        return true;
+    }
+
+    /** Master side: how many slaves were known from the last session. */
+    public static int knownSlaveCount() {
+        return printerModule == null ? 0 : printerModule.getSlaveNames().size();
+    }
+
     public static void setAllSlavesUnfinished() {
         for (String slave : finishedSlavesDict.keySet()) {
             finishedSlavesDict.put(slave, false);

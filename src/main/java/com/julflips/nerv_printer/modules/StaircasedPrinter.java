@@ -130,6 +130,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Boolean> autoStart = sgGeneral.add(new BoolSetting.Builder()
+        .name("auto-start")
+        .description("Start printing automatically after the module was enabled (a config has to be loaded). Waits for the slaves of the last session to connect first.")
+        .defaultValue(false)
+        .build()
+    );
+
     private final Setting<Boolean> customFolderPath = sgGeneral.add(new BoolSetting.Builder()
         .name("custom-folder-path")
         .description("Allows to set a custom path to the nbt folder.")
@@ -462,6 +469,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int restockSyncId = -1;                     //syncId of the container the restock backlog belongs to
     boolean building;                           //True while this bot is in the building phase
     boolean mining;                             //True while this bot is in the mining phase
+    boolean autoStartPending;                   //Waiting for the slaves before starting without the start block
+    boolean autoStartMining;                    //True when the pending start should resume mining
+    int autoStartTicks;                         //Timeout of the pending start
+    int autoStartSettle;                        //Short delay so the world is loaded before starting
+    static final int AUTO_START_TIMEOUT = 1200; //Ticks to wait for the slaves (~60s)
+    static final int AUTO_START_SETTLE = 100;   //Ticks to wait before starting (~5s)
     int minedLines;
     long lastTickTime;
     boolean closeNextInvPacket;
@@ -536,6 +549,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         restockSyncId = -1;
         building = false;
         mining = false;
+        autoStartPending = false;
+        autoStartMining = false;
+        autoStartTicks = 0;
+        autoStartSettle = 0;
         minedLines = 128;
         oldState = null;
         debugPreviousState = null;
@@ -590,6 +607,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         //Continue an interrupted map (and jump back into mining when that is where it stopped).
         applyProgress();
+
+        //Start without the start block when the user asked for it. Only the master does this,
+        //slaves are started by the master.
+        if (autoStart.get() && !autoStartPending && masterName.get().isEmpty()
+            && state == State.SelectingChests && mapCorner != null && map != null) {
+            autoStartPending = true;
+            autoStartMining = false;
+            autoStartTicks = AUTO_START_TIMEOUT;
+            autoStartSettle = AUTO_START_SETTLE;
+            info("Auto-start is enabled, waiting for the other bots to connect...");
+        }
     }
 
     @Override
@@ -876,6 +904,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (state == null) return;
+
+        if (autoStartPending) {
+            handleAutoStart();
+            if (autoStartPending) return;
+        }
 
         long timeDifference = System.currentTimeMillis() - lastTickTime;
         int allowedPlacements = (int) Math.floor(timeDifference / (long) placeDelay.get());
@@ -1601,6 +1634,39 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return isMined;
     }
 
+    /**
+     * Waits (with a timeout) until the slaves of the last session connected, then starts the print
+     * without the user having to interact with the start block.
+     */
+    private void handleAutoStart() {
+        if (mapCorner == null || map == null || state != State.SelectingChests) {
+            //Something is missing or the user took over - do not start on our own.
+            autoStartPending = false;
+            return;
+        }
+        boolean waitingForSlaves = !SlaveSystem.allKnownSlavesRegistered()
+            || (autoStartMining && !SlaveSystem.allSlavesFinished());
+        if (autoStartSettle > 0) {
+            autoStartSettle--;
+            return;
+        }
+        if (waitingForSlaves && autoStartTicks > 0) {
+            if (autoStartTicks % 200 == 0) {
+                info("Waiting for the other bots to connect... (" + SlaveSystem.slaves.size() + "/" + SlaveSystem.knownSlaveCount() + ")");
+            }
+            autoStartTicks--;
+            return;
+        }
+        autoStartPending = false;
+        if (autoStartMining) {
+            info("Resuming mining of §a" + mapFile.getName());
+            startMining();
+        } else {
+            info("Starting to print automatically.");
+            startBuilding();
+        }
+    }
+
     private void startBuilding() {
         info("Start building map");
         building = true;
@@ -2196,13 +2262,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 return;
             }
             if (masterName.get().isEmpty()) {
-                info("Resuming mining of §a" + progress.file);
-                startMining();
+                //Wait for the slaves of the last session before mining, so every bot gets its share.
+            autoStartPending = true;
+            autoStartMining = true;
+            autoStartTicks = AUTO_START_TIMEOUT;
+            autoStartSettle = AUTO_START_SETTLE;
+            info("Unfinished map §a" + progress.file + "§7 found, mining will be resumed.");
             } else {
                 info("Unfinished map §a" + progress.file + "§7 found. Waiting for the master to assign a mining line.");
             }
         } else {
-            info("Unfinished map §a" + progress.file + "§7 found, it will be finished first.");
+            if (mapCorner == null || materialDict.isEmpty()) {
+                info("Unfinished map §a" + progress.file + "§7 found. Load a config and start printing to continue.");
+            } else if (masterName.get().isEmpty()) {
+                //Continue the interrupted map without the start block, once the other bots are there.
+                autoStartPending = true;
+                autoStartMining = false;
+                autoStartTicks = AUTO_START_TIMEOUT;
+                autoStartSettle = AUTO_START_SETTLE;
+                info("Unfinished map §a" + progress.file + "§7 found, building will be continued.");
+            } else {
+                info("Unfinished map §a" + progress.file + "§7 found. Waiting for the master to start.");
+            }
         }
     }
 
